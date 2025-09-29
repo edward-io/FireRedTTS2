@@ -8,6 +8,7 @@ from typing import Union
 from torch.optim.lr_scheduler import LambdaLR
 from transformers import AutoTokenizer
 from fireredtts2.llm.llm import Model, ModelArgs
+from fireredtts2.utils.device import resolve_device
 
 
 @dataclass
@@ -225,7 +226,7 @@ def init_weights(model: nn.Module):
 def load_llm_model(
     configs,
     checkpoint_path: Union[str, Path] = None,
-    device: Union[str, torch.device] = "cuda",
+    device: Union[str, torch.device, None] = None,
 ) -> Model:
     """Load model, add forward method, and move to device.
 
@@ -254,7 +255,8 @@ def load_llm_model(
     else:
         model = init_weights(model)
 
-    model = model.to(device=device)
+    resolved_device = resolve_device(device)
+    model = model.to(device=resolved_device)
     return model
 
 

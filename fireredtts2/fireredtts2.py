@@ -8,12 +8,15 @@ from typing import List, Tuple
 from fireredtts2.codec import RedCodecInfer
 from fireredtts2.llm import load_llm_model, load_custom_tokenizer
 from fireredtts2.llm.utils import Segment
+from fireredtts2.utils.device import resolve_device
 from fireredtts2.utils.spliter import clean_text, split_text, process_text_list
 from tqdm import tqdm
 
 
 class FireRedTTS2:
     def __init__(self, pretrained_dir, gen_type, device):
+        resolved_device = resolve_device(device)
+        self.device = resolved_device
 
         assert os.path.exists(pretrained_dir)
         assert gen_type in ["monologue", "dialogue"]
@@ -37,7 +40,9 @@ class FireRedTTS2:
         # ==== Load Torch LLM ====
         llm_config = json.load(open(llm_config_path))
         self._model = load_llm_model(
-            configs=llm_config, checkpoint_path=llm_ckpt_path, device=device
+            configs=llm_config,
+            checkpoint_path=llm_ckpt_path,
+            device=self.device,
         )
         self._model.eval()
         self._model.setup_caches(1)
@@ -50,11 +55,10 @@ class FireRedTTS2:
         # ==== Load Torch Audio Tokenizer ====
         torch_codec = RedCodecInfer.from_pretrained(codec_config_path, codec_ckpt_path)
         torch_codec.eval()
-        self._audio_tokenizer = torch_codec.to(device)
+        self._audio_tokenizer = torch_codec.to(self.device)
         print("[INFO] Codec Loaded...")
 
         self.sample_rate = 16000
-        self.device = device
         self.max_seq_len = 3100
 
     def load_prompt_audio(self, audio_path) -> torch.Tensor:
