@@ -569,4 +569,4 @@ if __name__ == "__main__":
     print("[INFO] FireRedTTS-2 loaded")
     # UI
     page = render_interface()
-    page.launch()
+    page.launch(server_name="0.0.0.0")
