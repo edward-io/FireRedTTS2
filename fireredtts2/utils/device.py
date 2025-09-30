@@ -64,3 +64,51 @@ def empty_cache(device: torch.device | None = None) -> None:
         torch.cuda.empty_cache()
     elif target.type == "mps" and hasattr(torch, "mps") and _mps_available():
         torch.mps.empty_cache()  # type: ignore[attr-defined]
+
+
+def configure_inference_kernels(device: torch.device) -> None:
+    """Enable the fastest available attention kernels for the target device."""
+    try:
+        # "medium" opts into TF32 on Ampere+ while keeping fp32 fallback elsewhere.
+        precision = "medium" if device.type == "cuda" else "high"
+        torch.set_float32_matmul_precision(precision)
+    except Exception as exc:  # pragma: no cover - best effort tuning
+        warnings.warn(f"Failed to set matmul precision: {exc}")
+
+    if device.type == "cuda" and hasattr(torch.backends, "cuda"):
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            if hasattr(torch.backends, "cudnn"):
+                torch.backends.cudnn.allow_tf32 = True
+            if hasattr(torch.backends.cuda, "enable_flash_sdp"):
+                torch.backends.cuda.enable_flash_sdp(True)
+            if hasattr(torch.backends.cuda, "enable_mem_efficient_sdp"):
+                torch.backends.cuda.enable_mem_efficient_sdp(True)
+            if hasattr(torch.backends.cuda, "enable_math_sdp"):
+                torch.backends.cuda.enable_math_sdp(False)
+        except Exception as exc:  # pragma: no cover - best effort tuning
+            warnings.warn(f"Failed to configure CUDA SDPA kernels: {exc}")
+
+
+def maybe_compile_callable(
+    fn,
+    *,
+    description: str,
+    device: torch.device,
+    dynamic: bool = True,
+    mode: str = "reduce-overhead",
+):
+    """Wrap a callable with torch.compile when supported, else return it unchanged."""
+
+    compiler = getattr(torch, "compile", None)
+    if compiler is None:
+        return fn
+
+    if device.type not in {"cuda", "cpu"}:
+        return fn
+
+    try:
+        return compiler(fn, dynamic=dynamic, mode=mode)
+    except Exception as exc:  # pragma: no cover - dynamo can bail per backend
+        warnings.warn(f"torch.compile skipped for {description}: {exc}")
+        return fn

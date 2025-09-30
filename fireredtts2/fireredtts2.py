@@ -10,7 +10,11 @@ from spacy.language import Language
 from fireredtts2.codec import RedCodecInfer
 from fireredtts2.llm import load_llm_model, load_custom_tokenizer
 from fireredtts2.llm.utils import Segment
-from fireredtts2.utils.device import resolve_device
+from fireredtts2.utils.device import (
+    resolve_device,
+    configure_inference_kernels,
+    maybe_compile_callable,
+)
 from fireredtts2.utils.spliter import (
     clean_text,
     split_text,
@@ -24,9 +28,9 @@ class FireRedTTS2:
     def __init__(self, pretrained_dir, gen_type, device):
         resolved_device = resolve_device(device)
         self.device = resolved_device
+        configure_inference_kernels(self.device)
 
         def _summarize_module(module: torch.nn.Module, name: str):
-            return
             try:
                 p_dtypes = {}
                 p_devices = {}
@@ -47,6 +51,56 @@ class FireRedTTS2:
                     )
             except Exception as e:
                 print(f"[DEBUG] Failed to summarize {name}: {e}")
+
+        def _cast_model_mixed_precision(module: torch.nn.Module, target_dtype: torch.dtype):
+            """Cast non-normalization floating params/buffers to target_dtype, keep norms in fp32.
+            This avoids losing precision in norms by never downcasting them in the first place.
+            """
+            try:
+                # Identify normalization modules by class or name
+                norm_prefixes = set()
+                for mod_name, mod in module.named_modules():
+                    cls = mod.__class__.__name__.lower()
+                    # Treat any *Norm (e.g., RMSNorm) as normalization; avoid torch.nn.LayerNorm check specifically
+                    if cls.endswith("norm") or "rmsnorm" in cls or "norm" in mod_name.lower():
+                        norm_prefixes.add(mod_name)
+
+                # Debug: show what we matched as norms
+                if norm_prefixes:
+                    print(
+                        f"[DEBUG] Matched norm modules (count={len(norm_prefixes)}), e.g.: {sorted(list(norm_prefixes))[:3]}..."
+                    )
+
+                def _is_norm_param(param_name: str) -> bool:
+                    for prefix in norm_prefixes:
+                        if prefix and param_name.startswith(prefix + "."):
+                            return True
+                    return False
+
+                # Cast parameters
+                for name, p in module.named_parameters(recurse=True):
+                    if not hasattr(p, "data") or not p.data.is_floating_point():
+                        continue
+                    if _is_norm_param(name):
+                        # keep fp32
+                        if p.dtype != torch.float32:
+                            p.data = p.data.float()
+                    else:
+                        if p.dtype != target_dtype:
+                            p.data = p.data.to(dtype=target_dtype)
+
+                # Cast floating buffers (e.g., running stats) similarly
+                for name, b in module.named_buffers(recurse=True):
+                    if not hasattr(b, "data") or not getattr(b, "is_floating_point", lambda: False)():
+                        continue
+                    if _is_norm_param(name):
+                        if b.dtype != torch.float32:
+                            b.data = b.data.float()
+                    else:
+                        if b.dtype != target_dtype:
+                            b.data = b.data.to(dtype=target_dtype)
+            except Exception as e:
+                print(f"[WARN] Mixed-precision cast failed: {e}")
 
         assert os.path.exists(pretrained_dir)
         assert gen_type in ["monologue", "dialogue"]
@@ -74,24 +128,30 @@ class FireRedTTS2:
             checkpoint_path=llm_ckpt_path,
             device=self.device,
         )
-        # Prefer FP16 on MPS; BF16 on CUDA
+        # Prefer FP16 on MPS; BF16 on CUDA, but keep norms in FP32 (selective cast)
         if self.device.type == "mps":
-            try:
-                self._model = self._model.to(dtype=torch.float16)
-                print("[INFO] LLM cast to float16 on MPS")
-            except Exception as e:
-                print(f"[WARN] Could not cast LLM to float16 on MPS: {e}")
+            self._model.compute_dtype = torch.float16  # used by the model when creating caches
+            _cast_model_mixed_precision(self._model, torch.float16)
+            print("[INFO] LLM cast to float16 (non-norm) on MPS")
         elif self.device.type == "cuda":
-            try:
-                self._model = self._model.to(dtype=torch.bfloat16)
-                print("[INFO] LLM cast to bfloat16 on CUDA")
-            except Exception as e:
-                print(f"[WARN] Could not cast LLM to bfloat16 on CUDA: {e}")
+            self._model.compute_dtype = torch.bfloat16
+            _cast_model_mixed_precision(self._model, torch.bfloat16)
+            print("[INFO] LLM cast to bfloat16 (non-norm) on CUDA")
 
         self._model.eval()
         self._model.setup_caches(1)
         print("[INFO] LLM Loaded...")
         _summarize_module(self._model, "LLM")
+
+        # Cache hot inference callables and wrap them with torch.compile when possible
+        generate_frame_fn = self._model.generate_frame
+        self._generate_frame = maybe_compile_callable(
+            generate_frame_fn,
+            description="LLM.generate_frame",
+            device=self.device,
+        )
+        if self._generate_frame is not generate_frame_fn:
+            print("[INFO] torch.compile enabled for LLM generate_frame")
 
         # ==== Load Qwen2.5 Text Tokenizer ====
         self._text_tokenizer = load_custom_tokenizer(pretrained_qwen_path)
@@ -103,6 +163,15 @@ class FireRedTTS2:
         self._audio_tokenizer = torch_codec.to(self.device)
         print("[INFO] Codec Loaded...")
         _summarize_module(self._audio_tokenizer, "Codec")
+
+        codec_decode_fn = self._audio_tokenizer.decode
+        self._codec_decode = maybe_compile_callable(
+            codec_decode_fn,
+            description="Codec.decode",
+            device=self.device,
+        )
+        if self._codec_decode is not codec_decode_fn:
+            print("[INFO] torch.compile enabled for codec decode")
 
         self.sample_rate = 16000
         self.max_seq_len = 3100
@@ -260,7 +329,7 @@ class FireRedTTS2:
             )
 
         for _ in range(max_generation_len):
-            sample = self._model.generate_frame(
+            sample = self._generate_frame(
                 curr_tokens, curr_tokens_mask, curr_pos, temperature, topk
             )
             # eos
@@ -282,7 +351,7 @@ class FireRedTTS2:
             curr_pos = curr_pos[:, -1:] + 1
 
         audio = (
-            self._audio_tokenizer.decode(torch.stack(samples).permute(1, 2, 0))
+            self._codec_decode(torch.stack(samples).permute(1, 2, 0))
             .squeeze(0)
             .squeeze(0)
         )
@@ -315,7 +384,7 @@ class FireRedTTS2:
         num_token = 0
         start_time = time.time()
         for _ in range(max_generation_len):
-            sample = self._model.generate_frame(
+            sample = self._generate_frame(
                 curr_tokens, curr_tokens_mask, curr_pos, temperature, topk
             )
             # eos
@@ -518,36 +587,42 @@ class FireRedTTS2:
             assert os.path.exists(prompt_wav)
             assert prompt_text is not None
 
-            all_generated_segments = []
-            all_storage_segments = []
-            prompt_segments = []
-            prompt_text = clean_text(text=prompt_text)
+            prompt_text_accum = clean_text(text=prompt_text)
+            prompt_audio_16k = self.load_prompt_audio(prompt_wav)
             text_list = self._prepare_monologue_segments(
                 text=text, use_sentence_split=sentence_split
             )
 
             audio_list = []
-            history_segments: List[Segment] = []
+            last_history_segment: Segment | None = None
             history_limit = 1 if sentence_split else 0
             print(
                 f"[DEBUG] Using sentence_split={sentence_split} with {len(text_list)} segments"
             )
-            for parsed_text in text_list:
+            for idx, parsed_text in enumerate(text_list):
                 parsed_text = clean_text(text=parsed_text)
-                prompt_prefix = prompt_text[:-1] if prompt_text else ""
+                if not parsed_text:
+                    continue
+
+                prompt_prefix = prompt_text_accum[:-1] if prompt_text_accum else ""
                 input_text = (
                     (prompt_prefix + ", ") if prompt_prefix else ""
                 ) + parsed_text
-                print(
-                    f"[DEBUG] Prompted generation input: '{input_text}'"
-                )
-                prompt_a = self.prepare_prompt(
-                    text=input_text, speaker="[S1]", audio_path=prompt_wav
+                prompt_segment = Segment(
+                    text=input_text,
+                    speaker="[S1]",
+                    audio=prompt_audio_16k,
                 )
 
-                context = [prompt_a]
-                if history_limit > 0 and history_segments:
-                    context = context + history_segments[-history_limit:]
+                context: List[Segment] = []
+                if history_limit > 0 and last_history_segment is not None:
+                    context.append(last_history_segment)
+                context.append(prompt_segment)
+
+                context_texts = [seg.text for seg in context]
+                print(
+                    f"[DEBUG] Iter {idx}: context texts in order -> {context_texts}"
+                )
 
                 while True:
                     gen_tokens = self.generate_single(
@@ -559,70 +634,36 @@ class FireRedTTS2:
                     #     print("生成结果小于1s,重新跑")
 
                 gen_tokens = gen_tokens[:, :, 2:]  # cut leading silence
-                audio = self._audio_tokenizer.decode(gen_tokens).squeeze(0).squeeze(0)
+                audio = self._codec_decode(gen_tokens).squeeze(0).squeeze(0)
                 audio_list.append(audio.unsqueeze(0))
 
+                generated_audio_16k = torchaudio.functional.resample(
+                    audio.detach().cpu().unsqueeze(0), 24000, 16000
+                )
+
+                prompt_audio_16k = torch.cat(
+                    (prompt_audio_16k, generated_audio_16k), dim=1
+                )
+                prompt_text_accum = (
+                    (prompt_text_accum + " " + parsed_text).strip()
+                    if prompt_text_accum
+                    else parsed_text
+                )
+
+                print(
+                    f"[DEBUG] Iter {idx}: updated prompt_text_accum='{prompt_text_accum}'"
+                )
+                print(
+                    f"[DEBUG] Iter {idx}: prompt_audio_16k shape={prompt_audio_16k.shape}"
+                )
+
                 if history_limit > 0:
-                    # Resample on CPU to avoid MPS conv1d limitations
-                    history_audio = torchaudio.functional.resample(
-                        audio.detach().cpu().unsqueeze(0), 24000, 16000
+                    last_history_segment = Segment(
+                        text=parsed_text,
+                        speaker="[S1]",
+                        audio=generated_audio_16k,
                     )
-                    history_segments.append(
-                        Segment(text=parsed_text, speaker="[S1]", audio=history_audio)
-                    )
-                    if len(history_segments) > history_limit:
-                        history_segments = history_segments[-history_limit:]
 
             all_audio = torch.cat(tensors=audio_list, dim=1)
 
             return all_audio
-
-        else:
-            # random speaker
-            if not sentence_split:
-                cleaned_text = clean_text(text=text.strip())
-                print("[DEBUG] Using sentence_split=False; invoking single pass generation")
-                audio_tensor = self.generate(
-                    text=cleaned_text,
-                    speaker="[S1]",
-                    context=[],
-                    max_audio_length_ms=30_000,
-                    temperature=temperature,
-                    topk=topk,
-                )
-                return audio_tensor.unsqueeze(0)
-
-            segments = self._prepare_monologue_segments(
-                text=text.strip(), use_sentence_split=sentence_split
-            )
-            print(
-                f"[DEBUG] Using sentence_split={sentence_split} with {len(segments)} segments"
-            )
-
-            if len(segments) == 1:
-                audio_tensor = self.generate(
-                    text=segments[0],
-                    speaker="[S1]",
-                    context=[],
-                    max_audio_length_ms=30_000,
-                    temperature=temperature,
-                    topk=topk,
-                )
-                return audio_tensor.unsqueeze(0)
-
-            stored_segments: List[torch.Tensor] = []
-
-            for segment_text in segments:
-                print(f"[DEBUG] Generating independent segment: '{segment_text}'")
-                audio_tensor = self.generate(
-                    text=segment_text,
-                    speaker="[S1]",
-                    context=[],
-                    max_audio_length_ms=30_000,
-                    temperature=temperature,
-                    topk=topk,
-                )
-                stored_segments.append(audio_tensor.unsqueeze(0))
-
-            concatenated = torch.cat(stored_segments, dim=1)
-            return concatenated

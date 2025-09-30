@@ -122,7 +122,7 @@ class Model(nn.Module, PyTorchModelHubMixin):
 
     def setup_caches(self, max_batch_size: int) -> torch.Tensor:
         """Setup KV caches and return a causal mask."""
-        dtype = next(self.parameters()).dtype
+        dtype = getattr(self, "compute_dtype", next(self.parameters()).dtype)
         device = next(self.parameters()).device
 
         with device:
@@ -152,7 +152,7 @@ class Model(nn.Module, PyTorchModelHubMixin):
             tokens_mask: (batch_size, seq_len, n_codebooks+1)
         """
 
-        dtype = next(self.parameters()).dtype
+        dtype = getattr(self, "compute_dtype", next(self.parameters()).dtype)
         bsz, seq_len, _ = tokens.size()
         device = tokens.device
 
@@ -289,7 +289,7 @@ class Model(nn.Module, PyTorchModelHubMixin):
         Returns:
             (batch_size, audio_num_codebooks) sampled tokens
         """
-        dtype = next(self.parameters()).dtype
+        dtype = getattr(self, "compute_dtype", next(self.parameters()).dtype)
         b, s, _ = tokens.size()
 
         assert self.backbone.caches_are_enabled(), "backbone caches are not enabled"
