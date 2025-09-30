@@ -3,13 +3,20 @@ import time
 import json
 import torch
 import torchaudio
+import spacy
 
 from typing import List, Tuple
+from spacy.language import Language
 from fireredtts2.codec import RedCodecInfer
 from fireredtts2.llm import load_llm_model, load_custom_tokenizer
 from fireredtts2.llm.utils import Segment
 from fireredtts2.utils.device import resolve_device
-from fireredtts2.utils.spliter import clean_text, split_text, process_text_list
+from fireredtts2.utils.spliter import (
+    clean_text,
+    split_text,
+    process_text_list,
+    utf_8_len,
+)
 from tqdm import tqdm
 
 
@@ -17,6 +24,29 @@ class FireRedTTS2:
     def __init__(self, pretrained_dir, gen_type, device):
         resolved_device = resolve_device(device)
         self.device = resolved_device
+
+        def _summarize_module(module: torch.nn.Module, name: str):
+            return
+            try:
+                p_dtypes = {}
+                p_devices = {}
+                for p in module.parameters():
+                    p_dtypes[str(p.dtype)] = p_dtypes.get(str(p.dtype), 0) + 1
+                    p_devices[str(p.device)] = p_devices.get(str(p.device), 0) + 1
+                b_dtypes = {}
+                for b in module.buffers():
+                    if hasattr(b, "dtype"):
+                        b_dtypes[str(b.dtype)] = b_dtypes.get(str(b.dtype), 0) + 1
+
+                print(
+                    f"[DEBUG] {name} param dtypes: {sorted(p_dtypes.items())} | devices: {sorted(p_devices.items())}"
+                )
+                if b_dtypes:
+                    print(
+                        f"[DEBUG] {name} buffer dtypes: {sorted(b_dtypes.items())}"
+                    )
+            except Exception as e:
+                print(f"[DEBUG] Failed to summarize {name}: {e}")
 
         assert os.path.exists(pretrained_dir)
         assert gen_type in ["monologue", "dialogue"]
@@ -44,9 +74,24 @@ class FireRedTTS2:
             checkpoint_path=llm_ckpt_path,
             device=self.device,
         )
+        # Prefer FP16 on MPS; BF16 on CUDA
+        if self.device.type == "mps":
+            try:
+                self._model = self._model.to(dtype=torch.float16)
+                print("[INFO] LLM cast to float16 on MPS")
+            except Exception as e:
+                print(f"[WARN] Could not cast LLM to float16 on MPS: {e}")
+        elif self.device.type == "cuda":
+            try:
+                self._model = self._model.to(dtype=torch.bfloat16)
+                print("[INFO] LLM cast to bfloat16 on CUDA")
+            except Exception as e:
+                print(f"[WARN] Could not cast LLM to bfloat16 on CUDA: {e}")
+
         self._model.eval()
         self._model.setup_caches(1)
         print("[INFO] LLM Loaded...")
+        _summarize_module(self._model, "LLM")
 
         # ==== Load Qwen2.5 Text Tokenizer ====
         self._text_tokenizer = load_custom_tokenizer(pretrained_qwen_path)
@@ -57,9 +102,11 @@ class FireRedTTS2:
         torch_codec.eval()
         self._audio_tokenizer = torch_codec.to(self.device)
         print("[INFO] Codec Loaded...")
+        _summarize_module(self._audio_tokenizer, "Codec")
 
         self.sample_rate = 16000
         self.max_seq_len = 3100
+        self._sentence_splitter: Language | None = None
 
     def load_prompt_audio(self, audio_path) -> torch.Tensor:
         audio, audio_sr = torchaudio.load(audio_path)
@@ -72,6 +119,44 @@ class FireRedTTS2:
     def prepare_prompt(self, text, speaker, audio_path) -> Segment:
         audio_tensor = self.load_prompt_audio(audio_path)
         return Segment(text=text, speaker=speaker, audio=audio_tensor)
+
+    def _ensure_sentence_splitter(self) -> Language:
+        if self._sentence_splitter is None:
+            sentence_splitter = spacy.blank("xx")
+            if "sentencizer" not in sentence_splitter.pipe_names:
+                sentence_splitter.add_pipe("sentencizer")
+            self._sentence_splitter = sentence_splitter
+        return self._sentence_splitter
+
+    def _split_sentences(self, text: str) -> List[str]:
+        splitter = self._ensure_sentence_splitter()
+        doc = splitter(text)
+        sentences = [sent.text.strip() for sent in doc.sents if sent.text.strip()]
+        return sentences if sentences else [text.strip()]
+
+    def _prepare_monologue_segments(
+        self, text: str, use_sentence_split: bool, max_length: int = 400
+    ) -> List[str]:
+        if use_sentence_split:
+            raw_segments = self._split_sentences(text)
+            prepared_segments: List[str] = []
+            for segment in raw_segments:
+                cleaned_segment = clean_text(segment)
+                if not cleaned_segment:
+                    continue
+                if utf_8_len(cleaned_segment) > max_length:
+                    prepared_segments.extend(
+                        split_text(text=cleaned_segment, length=max_length)
+                    )
+                else:
+                    prepared_segments.append(cleaned_segment)
+            if prepared_segments:
+                return prepared_segments
+            text = clean_text(text)
+            return split_text(text=text, length=max_length)
+
+        cleaned_text = clean_text(text=text)
+        return split_text(text=cleaned_text, length=max_length)
 
     def _tokenize_text_segment(
         self, text: str, speaker: str
@@ -390,8 +475,9 @@ class FireRedTTS2:
             )
 
             # 做上下文管理的时候需要将audio 转到16k
+            # Resample on CPU to avoid MPS conv1d limitations
             audio_16k = torchaudio.functional.resample(
-                audio_tensor.unsqueeze(0), 24000, 16000
+                audio_tensor.detach().cpu().unsqueeze(0), 24000, 16000
             )
             all_generated_segments.append(
                 Segment(text=text, speaker=speaker, audio=audio_16k)
@@ -408,7 +494,13 @@ class FireRedTTS2:
 
     @torch.inference_mode()
     def generate_monologue(
-        self, text, prompt_wav=None, prompt_text=None, temperature=0.75, topk=20
+        self,
+        text,
+        prompt_wav=None,
+        prompt_text=None,
+        temperature=0.75,
+        topk=20,
+        sentence_split: bool = False,
     ):
         # step1. construct context
         if prompt_wav is not None:
@@ -419,18 +511,32 @@ class FireRedTTS2:
             all_storage_segments = []
             prompt_segments = []
             prompt_text = clean_text(text=prompt_text)
-            text = clean_text(text=text)
-            text_list = split_text(text=text, length=400)
+            text_list = self._prepare_monologue_segments(
+                text=text, use_sentence_split=sentence_split
+            )
 
             audio_list = []
-            for text in text_list:
-                text = clean_text(text=text)
-                input_text = prompt_text[:-1] + "," + text
+            history_segments: List[Segment] = []
+            history_limit = 1 if sentence_split else 0
+            print(
+                f"[DEBUG] Using sentence_split={sentence_split} with {len(text_list)} segments"
+            )
+            for parsed_text in text_list:
+                parsed_text = clean_text(text=parsed_text)
+                prompt_prefix = prompt_text[:-1] if prompt_text else ""
+                input_text = (
+                    (prompt_prefix + ", ") if prompt_prefix else ""
+                ) + parsed_text
+                print(
+                    f"[DEBUG] Prompted generation input: '{input_text}'"
+                )
                 prompt_a = self.prepare_prompt(
                     text=input_text, speaker="[S1]", audio_path=prompt_wav
                 )
 
                 context = [prompt_a]
+                if history_limit > 0 and history_segments:
+                    context = context + history_segments[-history_limit:]
 
                 while True:
                     gen_tokens = self.generate_single(
@@ -445,19 +551,67 @@ class FireRedTTS2:
                 audio = self._audio_tokenizer.decode(gen_tokens).squeeze(0).squeeze(0)
                 audio_list.append(audio.unsqueeze(0))
 
+                if history_limit > 0:
+                    # Resample on CPU to avoid MPS conv1d limitations
+                    history_audio = torchaudio.functional.resample(
+                        audio.detach().cpu().unsqueeze(0), 24000, 16000
+                    )
+                    history_segments.append(
+                        Segment(text=parsed_text, speaker="[S1]", audio=history_audio)
+                    )
+                    if len(history_segments) > history_limit:
+                        history_segments = history_segments[-history_limit:]
+
             all_audio = torch.cat(tensors=audio_list, dim=1)
 
             return all_audio
 
         else:
             # random speaker
-            text = clean_text(text=text.strip())
-            audio_tensor = self.generate(
-                text=text,
-                speaker="[S1]",
-                context=[],
-                max_audio_length_ms=30_000,
-                temperature=temperature,
-                topk=topk,
+            if not sentence_split:
+                cleaned_text = clean_text(text=text.strip())
+                print("[DEBUG] Using sentence_split=False; invoking single pass generation")
+                audio_tensor = self.generate(
+                    text=cleaned_text,
+                    speaker="[S1]",
+                    context=[],
+                    max_audio_length_ms=30_000,
+                    temperature=temperature,
+                    topk=topk,
+                )
+                return audio_tensor.unsqueeze(0)
+
+            segments = self._prepare_monologue_segments(
+                text=text.strip(), use_sentence_split=sentence_split
             )
-            return audio_tensor.unsqueeze(0)
+            print(
+                f"[DEBUG] Using sentence_split={sentence_split} with {len(segments)} segments"
+            )
+
+            if len(segments) == 1:
+                audio_tensor = self.generate(
+                    text=segments[0],
+                    speaker="[S1]",
+                    context=[],
+                    max_audio_length_ms=30_000,
+                    temperature=temperature,
+                    topk=topk,
+                )
+                return audio_tensor.unsqueeze(0)
+
+            stored_segments: List[torch.Tensor] = []
+
+            for segment_text in segments:
+                print(f"[DEBUG] Generating independent segment: '{segment_text}'")
+                audio_tensor = self.generate(
+                    text=segment_text,
+                    speaker="[S1]",
+                    context=[],
+                    max_audio_length_ms=30_000,
+                    temperature=temperature,
+                    topk=topk,
+                )
+                stored_segments.append(audio_tensor.unsqueeze(0))
+
+            concatenated = torch.cat(stored_segments, dim=1)
+            return concatenated

@@ -157,6 +157,10 @@ _i18n_key2lang_dict = dict(
         en="Generated Monologue Audio",
         zh="合成的独白音频",
     ),
+    sentence_split_label=dict(
+        en="Split sentences with spaCy",
+        zh="使用 spaCy 句子切分",
+    ),
     # Warining1: invalid text for prompt
     warn_invalid_spk1_prompt_text=dict(
         en='Invalid speaker 1 prompt text, should strictly follow: "[S1]xxx"',
@@ -182,7 +186,7 @@ _i18n_key2lang_dict = dict(
     ),
 )
 
-global_lang: Literal["zh", "en"] = "zh"
+global_lang: Literal["zh", "en"] = "en"
 
 
 def i18n(key):
@@ -222,6 +226,7 @@ def check_dialogue_text(text_list: List[str]) -> bool:
 def synthesis_function(
     mode: Literal[0, 1],
     target_text: str,
+    sentence_split: bool = False,
     voice_mode: Literal[0, 1] = 0,  # 0 means voice clone
     spk1_prompt_text: str | None = "",
     spk1_prompt_audio: str | None = None,
@@ -300,6 +305,7 @@ def synthesis_function(
         text=text,
         prompt_wav=prompt_wav,
         prompt_text=prompt_text,
+        sentence_split=sentence_split,
     )
     return (24000, target_audio.squeeze(0).cpu().numpy())
 
@@ -313,7 +319,7 @@ def render_interface() -> gr.Blocks:
         with gr.Row():
             lang_choice = gr.Radio(
                 choices=["中文", "English"],
-                value="中文",
+                value="English",
                 label="Display Language/显示语言",
                 type="index",
                 interactive=True,
@@ -323,7 +329,7 @@ def render_interface() -> gr.Blocks:
                     i18n("synthesis_mode_choice_dialogue"),
                     i18n("synthesis_mode_choice_monologue"),
                 ],
-                value=i18n("synthesis_mode_choice_dialogue"),
+                value=i18n("synthesis_mode_choice_monologue"),
                 label=i18n("synthesis_mode_label"),
                 type="index",
                 interactive=True,
@@ -352,7 +358,7 @@ def render_interface() -> gr.Blocks:
                     )
             # ==== Speaker2 Prompt ====
             with gr.Column(scale=1):
-                with gr.Group(visible=True) as spk2_prompt_group:
+                with gr.Group(visible=False) as spk2_prompt_group:
                     spk2_prompt_audio = gr.Audio(
                         label=i18n("spk2_prompt_audio_label"),
                         type="filepath",
@@ -367,9 +373,14 @@ def render_interface() -> gr.Blocks:
             # ==== Text input ====
             with gr.Column(scale=2):
                 dialogue_text_input = gr.Textbox(
-                    label=i18n("dialogue_text_input_label"),
-                    placeholder=i18n("dialogue_text_input_placeholder"),
+                    label=i18n("monologue_text_input_label"),
+                    placeholder=i18n("monologue_text_input_placeholder"),
                     lines=18,
+                )
+                sentence_split_checkbox = gr.Checkbox(
+                    label=i18n("sentence_split_label"),
+                    value=False,
+                    visible=True,
                 )
         # Generate button
         generate_btn = gr.Button(
@@ -377,7 +388,7 @@ def render_interface() -> gr.Blocks:
         )
         # Long output audio
         generate_audio = gr.Audio(
-            label=i18n("generated_audio_label"),
+            label=i18n("generated_monologue_label"),
             interactive=False,
         )
 
@@ -441,6 +452,8 @@ def render_interface() -> gr.Blocks:
                     label=i18n(text_label_key),
                     placeholder=i18n(text_placeholder_key),
                 ),
+                # sentence_split_checkbox
+                gr.update(label=i18n("sentence_split_label")),
                 # generate_btn
                 gr.update(value=i18n("generate_btn_label")),
                 # generate_audio
@@ -459,6 +472,7 @@ def render_interface() -> gr.Blocks:
                 spk2_prompt_audio,
                 spk2_prompt_text,
                 dialogue_text_input,
+                sentence_split_checkbox,
                 generate_btn,
                 generate_audio,
             ],
@@ -486,6 +500,7 @@ def render_interface() -> gr.Blocks:
             )
             show_spk1 = voice_mode == 0
             show_spk2 = voice_mode == 0 and mode == 0
+            show_sentence_split = mode == 1
 
             return [
                 gr.update(
@@ -495,6 +510,7 @@ def render_interface() -> gr.Blocks:
                 gr.update(label=i18n(audio_label_key), value=None),
                 gr.update(visible=show_spk1),
                 gr.update(visible=show_spk2),
+                gr.update(visible=show_sentence_split),
             ]
 
         mode_choice.change(
@@ -505,6 +521,7 @@ def render_interface() -> gr.Blocks:
                 generate_audio,
                 spk1_prompt_group,
                 spk2_prompt_group,
+                sentence_split_checkbox,
             ],
         )
 
@@ -523,6 +540,7 @@ def render_interface() -> gr.Blocks:
             inputs=[
                 mode_choice,
                 dialogue_text_input,
+                sentence_split_checkbox,
                 voice_mode_choice,
                 spk1_prompt_text,
                 spk1_prompt_audio,
