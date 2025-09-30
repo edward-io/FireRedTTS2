@@ -341,6 +341,17 @@ class FireRedTTS2:
                 duration = end_time - start_time
                 print("---first pack duration:", duration)
 
+        # If the model immediately produced EOS (no samples), avoid crashing here.
+        if len(samples) == 0:
+            print(
+                "[WARN] generate_single: immediate EOS (no samples). Returning empty token sequence."
+            )
+            return torch.zeros(
+                (1, self._model.config.audio_num_codebooks, 0),
+                dtype=torch.long,
+                device=self.device,
+            )
+
         gen_tokens = torch.stack(samples).permute(1, 2, 0)
 
         return gen_tokens
